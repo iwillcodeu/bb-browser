@@ -26,6 +26,16 @@ const LOCAL_SITES_DIR = join(BB_DIR, "sites");
 const COMMUNITY_SITES_DIR = join(BB_DIR, "bb-sites");
 const COMMUNITY_REPO = "https://github.com/epiral/bb-sites.git";
 
+function checkCliUpdate(): void {
+  try {
+    const current = execSync("bb-browser --version", { timeout: 3000, stdio: ["pipe", "pipe", "pipe"] }).toString().trim();
+    const latest = execSync("npm view bb-browser version", { timeout: 5000, stdio: ["pipe", "pipe", "pipe"] }).toString().trim();
+    if (latest && current && latest !== current && latest.localeCompare(current, undefined, { numeric: true }) > 0) {
+      console.log(`\n📦 bb-browser ${latest} available (current: ${current}). Run: npm install -g bb-browser`);
+    }
+  } catch {}
+}
+
 export interface SiteOptions {
   json?: boolean;
   tabId?: number;
@@ -303,6 +313,9 @@ function siteUpdate(): void {
   const sites = scanSites(COMMUNITY_SITES_DIR, "community");
   console.log(`已安装 ${sites.length} 个社区 adapter。`);
   console.log(`⭐ Like bb-browser? → bb-browser star`);
+
+  // Check for CLI updates
+  checkCliUpdate();
 }
 
 function findSiteByName(name: string): SiteMeta | undefined {
