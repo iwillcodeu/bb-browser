@@ -618,13 +618,21 @@ function loadBuildDomTreeScript(): string {
 }
 
 async function evaluate<T>(targetId: string, expression: string, returnByValue = true): Promise<T> {
-  const result = await sessionCommand<{ result: { value?: T; objectId?: string }; exceptionDetails?: { text?: string } }>(targetId, "Runtime.evaluate", {
+  const result = await sessionCommand<{
+    result: { value?: T; objectId?: string };
+    exceptionDetails?: { text?: string; exception?: { description?: string } };
+  }>(targetId, "Runtime.evaluate", {
     expression,
     awaitPromise: true,
     returnByValue,
+    replMode: true,
   });
   if (result.exceptionDetails) {
-    throw new Error(result.exceptionDetails.text || "Runtime.evaluate failed");
+    throw new Error(
+      result.exceptionDetails.exception?.description
+      || result.exceptionDetails.text
+      || "Runtime.evaluate failed",
+    );
   }
   return (result.result.value ?? result.result) as T;
 }
