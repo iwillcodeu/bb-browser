@@ -225,18 +225,22 @@ function matchTabOrigin(tabUrl: string, domain: string): boolean {
 function siteList(options: SiteOptions): void {
   const sites = getAllSites();
 
+  if (sites.length === 0) {
+    if (options.json) {
+      console.log("[]");
+      return;
+    }
+    console.log("未找到任何 site adapter。");
+    console.log("  安装社区 adapter: bb-browser site update");
+    console.log(`  私有 adapter 目录: ${LOCAL_SITES_DIR}`);
+    return;
+  }
+
   if (options.json) {
     console.log(JSON.stringify(sites.map(s => ({
       name: s.name, description: s.description, domain: s.domain,
       args: s.args, source: s.source,
     })), null, 2));
-    return;
-  }
-
-  if (sites.length === 0) {
-    console.log("未找到任何 site adapter。");
-    console.log("  安装社区 adapter: bb-browser site update");
-    console.log(`  私有 adapter 目录: ${LOCAL_SITES_DIR}`);
     return;
   }
 
@@ -268,16 +272,20 @@ function siteSearch(query: string, options: SiteOptions): void {
     s.domain.toLowerCase().includes(q)
   );
 
+  if (matches.length === 0) {
+    if (options.json) {
+      console.log("[]");
+      return;
+    }
+    console.log(`未找到匹配 "${query}" 的 adapter。`);
+    console.log("  查看所有: bb-browser site list");
+    return;
+  }
+
   if (options.json) {
     console.log(JSON.stringify(matches.map(s => ({
       name: s.name, description: s.description, domain: s.domain, source: s.source,
     })), null, 2));
-    return;
-  }
-
-  if (matches.length === 0) {
-    console.log(`未找到匹配 "${query}" 的 adapter。`);
-    console.log("  查看所有: bb-browser site list");
     return;
   }
 
@@ -438,7 +446,7 @@ async function siteRecommend(options: SiteOptions): Promise<void> {
           example: site.example || `bb-browser site ${site.name}`,
         })),
       });
-    } else if (item.visits >= 5 && item.domain && !item.domain.includes("localhost") && item.domain.includes(".")) {
+    } else if (item.visits >= 5 && item.domain && !item.domain.includes('localhost') && item.domain.includes('.')) {
       notAvailable.push(item);
     }
   }
@@ -486,13 +494,13 @@ async function siteRecommend(options: SiteOptions): Promise<void> {
   console.log();
   console.log('💡 跟你的 AI Agent 说 "把 notion.so CLI 化"，它就能自动完成。');
   console.log();
-  console.log("所有分析纯本地完成。用 --days 7 只看最近一周。");
+  console.log(`所有分析纯本地完成。用 --days 7 只看最近一周。`);
 }
 
 async function siteRun(
   name: string,
   args: string[],
-  options: SiteOptions,
+  options: SiteOptions
 ): Promise<void> {
   const sites = getAllSites();
   const site = sites.find(s => s.name === name);
@@ -529,7 +537,7 @@ async function siteRun(
       const flagName = args[i].slice(2);
       if (flagName in site.args && args[i + 1]) {
         argMap[flagName] = args[i + 1];
-        i++;
+        i++; // 跳过值
       }
     } else {
       positionalArgs.push(args[i]);
@@ -622,7 +630,7 @@ async function siteRun(
 
     if (options.jq) {
       const { applyJq } = await import("../jq.js");
-      const expr = options.jq.replace(/^\.data\./, ".");
+      const expr = options.jq.replace(/^\.data\./, '.');
       const results = applyJq(parsed, expr);
       for (const r of results) {
         console.log(typeof r === "string" ? r : JSON.stringify(r));
@@ -647,7 +655,7 @@ async function siteRun(
 
     if (listResp.success && listResp.data?.tabs) {
       const matchingTab = listResp.data.tabs.find((tab: TabInfo) =>
-        matchTabOrigin(tab.url, site.domain),
+        matchTabOrigin(tab.url, site.domain)
       );
       if (matchingTab) {
         targetTabId = matchingTab.tabId;
@@ -727,7 +735,7 @@ async function siteRun(
   if (options.jq) {
     const { applyJq } = await import("../jq.js");
     // Tolerate ".data." prefix — Agent may copy from --json envelope structure
-    const expr = options.jq.replace(/^\.data\./, ".");
+    const expr = options.jq.replace(/^\.data\./, '.');
     const results = applyJq(parsed, expr);
     for (const r of results) {
       console.log(typeof r === "string" ? r : JSON.stringify(r));
@@ -743,7 +751,7 @@ async function siteRun(
 
 export async function siteCommand(
   args: string[],
-  options: SiteOptions = {},
+  options: SiteOptions = {}
 ): Promise<void> {
   const subCommand = args[0];
 
@@ -777,9 +785,7 @@ export async function siteCommand(
   }
 
   switch (subCommand) {
-    case "list":
-      siteList(options);
-      break;
+    case "list":   siteList(options); break;
     case "search":
       if (!args[1]) {
         console.error("[error] site search: <query> is required.");
@@ -799,9 +805,7 @@ export async function siteCommand(
     case "recommend":
       await siteRecommend(options);
       break;
-    case "update":
-      siteUpdate(options);
-      break;
+    case "update":  siteUpdate(options); break;
     case "run":
       if (!args[1]) {
         console.error("[error] site run: <name> is required.");
