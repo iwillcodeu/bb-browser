@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
 
-import { COMMAND_TIMEOUT, DAEMON_BASE_URL } from "../packages/shared/src/constants.ts";
-import { generateId, type Request, type Response } from "../packages/shared/src/protocol.ts";
+import { COMMAND_TIMEOUT } from "../packages/shared/src/constants.ts";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 
 declare const process: {
   argv: string[];
@@ -12,6 +14,10 @@ declare const process: {
 const DEFAULT_PINIX_URL = "ws://127.0.0.1:9000/ws/capability";
 const DEFAULT_CAPABILITY_NAME = "browser";
 const RECONNECT_DELAY_MS = 5000;
+const DEFAULT_CDP_PORT = 19825;
+const CDP_PORT_FILE = join(homedir(), ".bb-browser", "browser", "cdp-port");
+const WAIT_POLL_INTERVAL = 200;
+
 const CAPABILITIES = [
   "navigate",
   "click",
@@ -45,114 +51,244 @@ interface PinixInvokeMessage {
 interface PinixResultMessage {
   id: string;
   output?: unknown;
-  error?: string;
+  error?: { message: string; code: string };
 }
 
-interface CommandDefinition {
-  buildRequest(input: InputObject): Omit<Request, "id">;
-  transform(response: Response, input: InputObject): unknown;
+// ─── CDP Client ───────────────────────────────────────────────
+
+interface CdpTarget {
+  id: string;
+  type: string;
+  title: string;
+  url: string;
+  webSocketDebuggerUrl?: string;
 }
 
-const COMMAND_DEFINITIONS: Record<CapabilityCommand, CommandDefinition> = {
-  navigate: {
-    buildRequest(input) {
-      return {
-        action: "open",
-        url: getRequiredString(input, "url"),
-        tabId: getOptionalTabId(input),
-      };
-    },
-    transform(response, input) {
-      return {
-        url: getResponseString(response.data?.url, getRequiredString(input, "url")),
-        title: getResponseString(response.data?.title, ""),
-      };
-    },
-  },
-  click: {
-    buildRequest(input) {
-      return {
-        action: "click",
-        ref: getRequiredString(input, "selector", "ref"),
-        tabId: getOptionalTabId(input),
-      };
-    },
-    transform() {
-      return {};
-    },
-  },
-  type: {
-    buildRequest(input) {
-      return {
-        action: "type",
-        ref: getRequiredString(input, "selector", "ref"),
-        text: getRequiredStringAllowEmpty(input, "text"),
-        tabId: getOptionalTabId(input),
-      };
-    },
-    transform() {
-      return {};
-    },
-  },
-  evaluate: {
-    buildRequest(input) {
-      return {
-        action: "eval",
-        script: getRequiredString(input, "js", "script"),
-        tabId: getOptionalTabId(input),
-      };
-    },
-    transform(response) {
-      return { result: response.data?.result ?? null };
-    },
-  },
-  screenshot: {
-    buildRequest(input) {
-      return {
-        action: "screenshot",
-        tabId: getOptionalTabId(input),
-      };
-    },
-    transform(response) {
-      const dataUrl = response.data?.dataUrl;
-      if (typeof dataUrl !== "string" || dataUrl.length === 0) {
-        throw new Error("Screenshot data missing from daemon response");
-      }
+let cdpSocket: WebSocket | null = null;
+let cdpNextId = 1;
+let cdpSessionId: string | null = null;
+let cdpTargetId: string | null = null;
+const cdpPending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
 
-      return { base64: stripDataUrlPrefix(dataUrl) };
-    },
-  },
-  getCookies: {
-    buildRequest(input) {
-      return {
-        action: "eval",
-        script: "document.cookie",
-        tabId: getOptionalTabId(input),
-      };
-    },
-    transform(response) {
-      const cookieString = response.data?.result;
-      if (typeof cookieString !== "string") {
-        throw new Error("Cookie string missing from daemon response");
-      }
+function discoverCdpPort(): number {
+  try {
+    const content = readFileSync(CDP_PORT_FILE, "utf-8").trim();
+    const port = parseInt(content, 10);
+    return isNaN(port) ? DEFAULT_CDP_PORT : port;
+  } catch {
+    return DEFAULT_CDP_PORT;
+  }
+}
 
-      return { cookies: parseCookies(cookieString) };
-    },
-  },
-  waitForSelector: {
-    buildRequest(input) {
-      return {
-        action: "wait",
-        waitType: "element",
-        ref: getRequiredString(input, "selector", "ref"),
-        tabId: getOptionalTabId(input),
-      };
-    },
-    transform() {
-      return {};
-    },
-  },
+async function ensureCdp(): Promise<void> {
+  if (cdpSocket && cdpSocket.readyState === WebSocket.OPEN && cdpSessionId) {
+    return;
+  }
+
+  const port = discoverCdpPort();
+
+  // Get browser WebSocket URL
+  const versionRes = await fetch(`http://127.0.0.1:${port}/json/version`);
+  if (!versionRes.ok) throw new Error(`Chrome not reachable at port ${port}`);
+  const version = (await versionRes.json()) as { webSocketDebuggerUrl?: string };
+  const wsUrl = version.webSocketDebuggerUrl;
+  if (!wsUrl) throw new Error("Chrome CDP missing webSocketDebuggerUrl");
+
+  // Connect browser WebSocket
+  await new Promise<void>((resolve, reject) => {
+    const ws = new WebSocket(wsUrl);
+    ws.onopen = () => {
+      cdpSocket = ws;
+      console.log(`[bb-browserd] CDP connected to ${wsUrl}`);
+      resolve();
+    };
+    ws.onerror = () => reject(new Error(`CDP WebSocket connection failed`));
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(typeof event.data === "string" ? event.data : new TextDecoder().decode(event.data as ArrayBuffer));
+        if (typeof msg.id === "number") {
+          const pending = cdpPending.get(msg.id);
+          if (pending) {
+            cdpPending.delete(msg.id);
+            if (msg.error) pending.reject(new Error(msg.error.message || "CDP error"));
+            else pending.resolve(msg.result);
+          }
+        }
+      } catch {}
+    };
+    ws.onclose = () => {
+      cdpSocket = null;
+      cdpSessionId = null;
+      cdpTargetId = null;
+      console.error("[bb-browserd] CDP disconnected");
+    };
+  });
+
+  // Find a page target
+  const targetsRes = await fetch(`http://127.0.0.1:${port}/json/list`);
+  const targets = (await targetsRes.json()) as CdpTarget[];
+  const page = targets.find((t) => t.type === "page");
+  if (!page) throw new Error("No page target found in Chrome");
+
+  // Attach to target
+  const attachResult = await cdpBrowserCommand<{ sessionId: string }>("Target.attachToTarget", {
+    targetId: page.id,
+    flatten: true,
+  });
+  cdpSessionId = attachResult.sessionId;
+  cdpTargetId = page.id;
+  console.log(`[bb-browserd] Attached to target: ${page.title} (${page.url})`);
+}
+
+function cdpBrowserCommand<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+  if (!cdpSocket || cdpSocket.readyState !== WebSocket.OPEN) {
+    return Promise.reject(new Error("CDP not connected"));
+  }
+  const id = cdpNextId++;
+  return new Promise<T>((resolve, reject) => {
+    cdpPending.set(id, { resolve, reject });
+    cdpSocket!.send(JSON.stringify({ id, method, params }));
+    setTimeout(() => {
+      if (cdpPending.has(id)) {
+        cdpPending.delete(id);
+        reject(new Error(`CDP command ${method} timed out`));
+      }
+    }, COMMAND_TIMEOUT);
+  });
+}
+
+function cdpSessionCommand<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+  if (!cdpSocket || cdpSocket.readyState !== WebSocket.OPEN || !cdpSessionId) {
+    return Promise.reject(new Error("CDP session not available"));
+  }
+  const id = cdpNextId++;
+  return new Promise<T>((resolve, reject) => {
+    cdpPending.set(id, { resolve, reject });
+    cdpSocket!.send(JSON.stringify({ id, method, params, sessionId: cdpSessionId }));
+    setTimeout(() => {
+      if (cdpPending.has(id)) {
+        cdpPending.delete(id);
+        reject(new Error(`CDP command ${method} timed out`));
+      }
+    }, COMMAND_TIMEOUT);
+  });
+}
+
+// ─── Command Implementations ─────────────────────────────────
+
+async function cmdNavigate(input: InputObject): Promise<unknown> {
+  const url = getRequiredString(input, "url");
+  await ensureCdp();
+  await cdpSessionCommand("Page.navigate", { url });
+  // Wait a bit for load
+  await new Promise((r) => setTimeout(r, 1000));
+  const result = await cdpSessionCommand<{ result: { value: unknown } }>("Runtime.evaluate", {
+    expression: "JSON.stringify({url: location.href, title: document.title})",
+    returnByValue: true,
+  });
+  return JSON.parse(result.result.value as string);
+}
+
+async function cmdClick(input: InputObject): Promise<unknown> {
+  const selector = getRequiredString(input, "selector", "ref");
+  await ensureCdp();
+  await cdpSessionCommand("Runtime.evaluate", {
+    expression: `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) throw new Error("Element not found: ${selector}"); el.click(); })()`,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  return {};
+}
+
+async function cmdType(input: InputObject): Promise<unknown> {
+  const selector = getRequiredString(input, "selector", "ref");
+  const text = getRequiredStringAllowEmpty(input, "text");
+  await ensureCdp();
+  await cdpSessionCommand("Runtime.evaluate", {
+    expression: `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) throw new Error("Element not found: ${selector}"); el.focus(); el.value += ${JSON.stringify(text)}; el.dispatchEvent(new Event("input", {bubbles:true})); })()`,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  return {};
+}
+
+async function cmdEvaluate(input: InputObject): Promise<unknown> {
+  const js = getRequiredString(input, "js", "script");
+  await ensureCdp();
+  const result = await cdpSessionCommand<{
+    result: { value?: unknown };
+    exceptionDetails?: { text?: string; exception?: { description?: string } };
+  }>("Runtime.evaluate", {
+    expression: js,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  if (result.exceptionDetails) {
+    throw new Error(
+      result.exceptionDetails.exception?.description ||
+      result.exceptionDetails.text ||
+      "Runtime.evaluate failed"
+    );
+  }
+  return { result: result.result.value ?? null };
+}
+
+async function cmdScreenshot(_input: InputObject): Promise<unknown> {
+  await ensureCdp();
+  const result = await cdpSessionCommand<{ data: string }>("Page.captureScreenshot", {
+    format: "png",
+  });
+  return { base64: result.data };
+}
+
+async function cmdGetCookies(_input: InputObject): Promise<unknown> {
+  await ensureCdp();
+  const result = await cdpSessionCommand<{ cookies: Array<{ name: string; value: string; domain: string; path: string }> }>(
+    "Network.getCookies",
+    {}
+  );
+  return {
+    cookies: result.cookies.map((c) => ({
+      name: c.name,
+      value: c.value,
+      domain: c.domain,
+      path: c.path,
+    })),
+  };
+}
+
+async function cmdWaitForSelector(input: InputObject): Promise<unknown> {
+  const selector = getRequiredString(input, "selector", "ref");
+  const timeout = typeof input.timeout === "number" ? input.timeout : 10000;
+  await ensureCdp();
+
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const result = await cdpSessionCommand<{ result: { value: unknown } }>("Runtime.evaluate", {
+      expression: `document.querySelector(${JSON.stringify(selector)}) !== null`,
+      returnByValue: true,
+    });
+    if (result.result.value === true) return {};
+    await new Promise((r) => setTimeout(r, WAIT_POLL_INTERVAL));
+  }
+  throw new Error(`Timeout waiting for selector: ${selector}`);
+}
+
+const COMMAND_HANDLERS: Record<CapabilityCommand, (input: InputObject) => Promise<unknown>> = {
+  navigate: cmdNavigate,
+  click: cmdClick,
+  type: cmdType,
+  evaluate: cmdEvaluate,
+  screenshot: cmdScreenshot,
+  getCookies: cmdGetCookies,
+  waitForSelector: cmdWaitForSelector,
 };
+
+async function executeCommand(command: CapabilityCommand, input: InputObject): Promise<unknown> {
+  return COMMAND_HANDLERS[command](input);
+}
+
+// ─── Helpers ──────────────────────────────────────────────────
 
 function printUsage(): void {
   console.log(`Usage: bun run bin/bb-browserd.ts [--pinix <url>] [--name <name>]
@@ -169,25 +305,18 @@ function parseArgs(argv: string[]): Options {
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-
     if (arg === "--pinix") {
       pinixUrl = getFlagValue(argv, index, "--pinix");
       index += 1;
-      continue;
-    }
-
-    if (arg === "--name") {
+    } else if (arg === "--name") {
       name = getFlagValue(argv, index, "--name");
       index += 1;
-      continue;
-    }
-
-    if (arg === "--help" || arg === "-h") {
+    } else if (arg === "--help" || arg === "-h") {
       printUsage();
       process.exit(0);
+    } else {
+      throw new Error(`Unknown argument: ${arg}`);
     }
-
-    throw new Error(`Unknown argument: ${arg}`);
   }
 
   return { pinixUrl, name };
@@ -195,9 +324,7 @@ function parseArgs(argv: string[]): Options {
 
 function getFlagValue(argv: string[], index: number, flag: string): string {
   const value = argv[index + 1];
-  if (!value || value.startsWith("--")) {
-    throw new Error(`Missing value for ${flag}`);
-  }
+  if (!value || value.startsWith("--")) throw new Error(`Missing value for ${flag}`);
   return value;
 }
 
@@ -206,192 +333,51 @@ function isCapabilityCommand(command: string): command is CapabilityCommand {
 }
 
 function asInputObject(value: unknown): InputObject {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return {};
-  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   return value as InputObject;
 }
 
 function getRequiredString(input: InputObject, ...keys: string[]): string {
-  return getRequiredStringInternal(input, keys, false);
-}
-
-function getRequiredStringAllowEmpty(input: InputObject, ...keys: string[]): string {
-  return getRequiredStringInternal(input, keys, true);
-}
-
-function getRequiredStringInternal(input: InputObject, keys: string[], allowEmpty: boolean): string {
   for (const key of keys) {
     const value = input[key];
-    if (typeof value === "string" && (allowEmpty || value.trim().length > 0)) {
-      return value;
-    }
+    if (typeof value === "string" && value.trim().length > 0) return value;
   }
-
   throw new Error(`Missing or invalid "${keys[0]}"`);
 }
 
-function getOptionalTabId(input: InputObject): string | number | undefined {
-  const tabId = input.tabId;
-  if (typeof tabId === "string" || typeof tabId === "number") {
-    return tabId;
+function getRequiredStringAllowEmpty(input: InputObject, ...keys: string[]): string {
+  for (const key of keys) {
+    const value = input[key];
+    if (typeof value === "string") return value;
   }
-  return undefined;
-}
-
-function getResponseString(value: unknown, fallback: string): string {
-  return typeof value === "string" ? value : fallback;
-}
-
-function parseCookies(cookieString: string): Array<{ name: string; value: string }> {
-  if (cookieString.trim().length === 0) {
-    return [];
-  }
-
-  return cookieString
-    .split(";")
-    .map((part) => part.trim())
-    .filter((part) => part.length > 0)
-    .map((part) => {
-      const separatorIndex = part.indexOf("=");
-      if (separatorIndex === -1) {
-        return { name: part, value: "" };
-      }
-
-      return {
-        name: part.slice(0, separatorIndex).trim(),
-        value: part.slice(separatorIndex + 1).trim(),
-      };
-    })
-    .filter((cookie) => cookie.name.length > 0);
-}
-
-function stripDataUrlPrefix(dataUrl: string): string {
-  const commaIndex = dataUrl.indexOf(",");
-  if (dataUrl.startsWith("data:") && commaIndex !== -1) {
-    return dataUrl.slice(commaIndex + 1);
-  }
-  return dataUrl;
+  throw new Error(`Missing or invalid "${keys[0]}"`);
 }
 
 function formatError(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message;
-  }
+  if (error instanceof Error) return error.message;
   return String(error);
 }
 
 function isPinixInvokeMessage(value: unknown): value is PinixInvokeMessage {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-
-  const candidate = value as Record<string, unknown>;
-  return typeof candidate.id === "string" && typeof candidate.command === "string";
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const c = value as Record<string, unknown>;
+  return typeof c.id === "string" && typeof c.command === "string";
 }
 
 function isPingMessage(value: unknown): boolean {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   return (value as Record<string, unknown>).type === "ping";
 }
 
 async function readTextMessage(data: unknown): Promise<string | null> {
-  if (typeof data === "string") {
-    return data;
-  }
-
-  if (data instanceof ArrayBuffer) {
-    return new TextDecoder().decode(data);
-  }
-
-  if (ArrayBuffer.isView(data)) {
-    return new TextDecoder().decode(
-      new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
-    );
-  }
-
-  if (data instanceof Blob) {
-    return data.text();
-  }
-
+  if (typeof data === "string") return data;
+  if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
+  if (ArrayBuffer.isView(data)) return new TextDecoder().decode(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+  if (data instanceof Blob) return data.text();
   return null;
 }
 
-async function sendToDaemon(request: Request): Promise<Response> {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), COMMAND_TIMEOUT);
-
-  try {
-    const response = await fetch(`${DAEMON_BASE_URL}/command`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(request),
-      signal: controller.signal,
-    });
-
-    const rawBody = await response.text();
-    clearTimeout(timeoutId);
-
-    let parsedBody: unknown = null;
-    if (rawBody.length > 0) {
-      try {
-        parsedBody = JSON.parse(rawBody);
-      } catch {
-        return {
-          id: request.id,
-          success: false,
-          error: `Daemon returned invalid JSON (HTTP ${response.status})`,
-        };
-      }
-    }
-
-    if (parsedBody && typeof parsedBody === "object" && !Array.isArray(parsedBody)) {
-      return parsedBody as Response;
-    }
-
-    return {
-      id: request.id,
-      success: false,
-      error: response.ok
-        ? "Daemon returned an empty response"
-        : `Daemon request failed with HTTP ${response.status}`,
-    };
-  } catch (error) {
-    clearTimeout(timeoutId);
-
-    if (error instanceof Error && error.name === "AbortError") {
-      return {
-        id: request.id,
-        success: false,
-        error: `Daemon request timed out after ${COMMAND_TIMEOUT}ms`,
-      };
-    }
-
-    return {
-      id: request.id,
-      success: false,
-      error: `Failed to reach bb-browser daemon at ${DAEMON_BASE_URL}: ${formatError(error)}`,
-    };
-  }
-}
-
-async function executeCommand(command: CapabilityCommand, input: InputObject): Promise<unknown> {
-  const definition = COMMAND_DEFINITIONS[command];
-  const request: Request = {
-    id: generateId(),
-    ...definition.buildRequest(input),
-  };
-
-  const response = await sendToDaemon(request);
-  if (!response.success) {
-    throw new Error(response.error || `Daemon action "${request.action}" failed`);
-  }
-
-  return definition.transform(response, input);
-}
+// ─── Pinix Bridge ─────────────────────────────────────────────
 
 class PinixBridge {
   private socket: WebSocket | null = null;
@@ -400,35 +386,22 @@ class PinixBridge {
 
   constructor(private readonly options: Options) {}
 
-  start(): void {
-    this.connect();
-  }
+  start(): void { this.connect(); }
 
   stop(): void {
     this.stopped = true;
-
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
     if (this.socket && this.socket.readyState !== WebSocket.CLOSING && this.socket.readyState !== WebSocket.CLOSED) {
       this.socket.close();
     }
   }
 
   private connect(): void {
-    if (this.stopped) {
-      return;
-    }
-
-    if (this.socket && (this.socket.readyState === WebSocket.CONNECTING || this.socket.readyState === WebSocket.OPEN)) {
-      return;
-    }
+    if (this.stopped) return;
+    if (this.socket && (this.socket.readyState === WebSocket.CONNECTING || this.socket.readyState === WebSocket.OPEN)) return;
 
     console.log(`[bb-browserd] Connecting to ${this.options.pinixUrl}`);
     let socket: WebSocket;
-
     try {
       socket = new WebSocket(this.options.pinixUrl);
     } catch (error) {
@@ -440,82 +413,45 @@ class PinixBridge {
     this.socket = socket;
 
     socket.onopen = () => {
-      if (this.socket !== socket) {
-        return;
-      }
-
+      if (this.socket !== socket) return;
       console.log(`[bb-browserd] Connected to pinixd at ${this.options.pinixUrl}`);
       this.clearReconnectTimer();
       this.register(socket);
     };
 
     socket.onmessage = (event) => {
-      if (this.socket !== socket) {
-        return;
-      }
-
+      if (this.socket !== socket) return;
       void this.handleMessage(socket, event.data);
     };
 
     socket.onerror = () => {
-      if (this.socket !== socket) {
-        return;
-      }
-
+      if (this.socket !== socket) return;
       console.error("[bb-browserd] WebSocket error");
     };
 
     socket.onclose = (event) => {
-      if (this.socket === socket) {
-        this.socket = null;
-      }
-
-      const details = event.reason ? ` ${event.code} ${event.reason}` : ` ${event.code}`;
-      console.error(`[bb-browserd] Disconnected from pinixd:${details}`);
-
-      if (!this.stopped) {
-        this.scheduleReconnect();
-      }
+      if (this.socket === socket) this.socket = null;
+      console.error(`[bb-browserd] Disconnected from pinixd: ${event.code}`);
+      if (!this.stopped) this.scheduleReconnect();
     };
   }
 
   private register(socket: WebSocket): void {
-    const message: PinixRegisterMessage = {
-      type: "register",
-      name: this.options.name,
-      capabilities: CAPABILITIES,
-    };
-
+    const message: PinixRegisterMessage = { type: "register", name: this.options.name, capabilities: CAPABILITIES };
     if (this.send(socket, message)) {
-      console.log(
-        `[bb-browserd] Registered capability "${this.options.name}" with commands: ${CAPABILITIES.join(", ")}`,
-      );
+      console.log(`[bb-browserd] Registered capability "${this.options.name}" with commands: ${CAPABILITIES.join(", ")}`);
     }
   }
 
   private async handleMessage(socket: WebSocket, rawData: unknown): Promise<void> {
     const text = await readTextMessage(rawData);
-    if (text === null) {
-      console.error("[bb-browserd] Ignoring non-text WebSocket message");
-      return;
-    }
+    if (text === null) return;
 
     let message: unknown;
-    try {
-      message = JSON.parse(text);
-    } catch (error) {
-      console.error(`[bb-browserd] Failed to parse message: ${formatError(error)}`);
-      return;
-    }
+    try { message = JSON.parse(text); } catch { return; }
 
-    if (isPingMessage(message)) {
-      this.send(socket, { type: "pong" });
-      return;
-    }
-
-    if (!isPinixInvokeMessage(message)) {
-      return;
-    }
+    if (isPingMessage(message)) { this.send(socket, { type: "pong" }); return; }
+    if (!isPinixInvokeMessage(message)) return;
 
     await this.handleInvocation(socket, message);
   }
@@ -535,75 +471,39 @@ class PinixBridge {
   }
 
   private sendError(socket: WebSocket, id: string, error: string): void {
-    this.send(socket, { id, error } satisfies PinixResultMessage);
+    this.send(socket, { id, error: { message: error, code: "ERROR" } } satisfies PinixResultMessage);
   }
 
   private send(socket: WebSocket, payload: PinixRegisterMessage | PinixResultMessage | { type: "pong" }): boolean {
-    if (socket.readyState !== WebSocket.OPEN) {
-      console.error("[bb-browserd] Socket is not open; dropping outbound message");
-      return false;
-    }
-
-    try {
-      socket.send(JSON.stringify(payload));
-      return true;
-    } catch (error) {
-      console.error(`[bb-browserd] Failed to send message: ${formatError(error)}`);
-      return false;
-    }
+    if (socket.readyState !== WebSocket.OPEN) return false;
+    try { socket.send(JSON.stringify(payload)); return true; } catch { return false; }
   }
 
   private scheduleReconnect(): void {
-    if (this.reconnectTimer || this.stopped) {
-      return;
-    }
-
+    if (this.reconnectTimer || this.stopped) return;
     console.log(`[bb-browserd] Reconnecting in ${RECONNECT_DELAY_MS}ms`);
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      this.connect();
-    }, RECONNECT_DELAY_MS);
+    this.reconnectTimer = setTimeout(() => { this.reconnectTimer = null; this.connect(); }, RECONNECT_DELAY_MS);
   }
 
   private clearReconnectTimer(): void {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
   }
 }
 
+// ─── Main ─────────────────────────────────────────────────────
+
 function installProcessHandlers(bridge: PinixBridge): void {
-  process.on("SIGINT", () => {
-    bridge.stop();
-    process.exit(0);
-  });
-
-  process.on("SIGTERM", () => {
-    bridge.stop();
-    process.exit(0);
-  });
-
-  process.on("unhandledRejection", (reason) => {
-    console.error(`[bb-browserd] Unhandled rejection: ${formatError(reason)}`);
-  });
-
-  process.on("uncaughtException", (error) => {
-    console.error(`[bb-browserd] Uncaught exception: ${formatError(error)}`);
-  });
+  process.on("SIGINT", () => { bridge.stop(); process.exit(0); });
+  process.on("SIGTERM", () => { bridge.stop(); process.exit(0); });
+  process.on("unhandledRejection", (reason) => { console.error(`[bb-browserd] Unhandled rejection: ${formatError(reason)}`); });
+  process.on("uncaughtException", (error) => { console.error(`[bb-browserd] Uncaught exception: ${formatError(error)}`); });
 }
 
 function main(): void {
   const options = parseArgs(process.argv.slice(2));
   const bridge = new PinixBridge(options);
-
   installProcessHandlers(bridge);
   bridge.start();
 }
 
-try {
-  main();
-} catch (error) {
-  console.error(`[bb-browserd] ${formatError(error)}`);
-  process.exit(1);
-}
+try { main(); } catch (error) { console.error(`[bb-browserd] ${formatError(error)}`); process.exit(1); }
